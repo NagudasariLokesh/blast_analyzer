@@ -1,7 +1,11 @@
+import argparse
+import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
+import blast_analyzer
 from blast_analyzer import BlastRadiusAnalyzer
 
 
@@ -85,6 +89,105 @@ class BlastAnalyzerTests(unittest.TestCase):
         relaxed.build_graph()
         _, target = relaxed.validate_and_normalize_intent(raw)
         self.assertEqual(target, "function:services.user_service.create_user")
+
+    def _gemini_args(self, client_change_file: str) -> argparse.Namespace:
+        return argparse.Namespace(
+            project_path="project",
+            allow_symbol_target=False,
+            intent_file=None,
+            intent_json=None,
+            intent_from_gemini=True,
+            client_change_file=client_change_file,
+            gemini_model="gemini-test-model",
+            gemini_debug=False,
+            list_targets=False,
+            output_json="blast_report.json",
+            output_md="blast_report.md",
+        )
+
+    def test_load_intent_from_gemini_success_path(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            change_file = Path(tmpdir) / "client.diff"
+            change_file.write_text("rename age -> user_age in request payload", encoding="utf-8")
+            args = self._gemini_args(str(change_file))
+            inferred = {
+                "change_type": "function_logic_change",
+                "target": "function:services.user_service.create_user",
+                "modification": "adjust validation flow",
+            }
+
+            with patch(
+                "blast_analyzer._infer_intent_with_gemini_attempt",
+                return_value=(inferred, json.dumps(inferred)),
+            ) as mocked:
+                raw = blast_analyzer.load_intent(args, self.analyzer)
+
+            self.assertEqual(raw, inferred)
+            self.assertEqual(mocked.call_count, 1)
+
+    def test_load_intent_from_gemini_retries_after_validation_error(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            change_file = Path(tmpdir) / "client.diff"
+            change_file.write_text("client contract update", encoding="utf-8")
+            args = self._gemini_args(str(change_file))
+
+            invalid = {
+                "change_type": "function_logic_change",
+                "target": "function:does.not.exist",
+                "modification": "adjust validation flow",
+            }
+            valid = {
+                "change_type": "function_logic_change",
+                "target": "function:services.user_service.create_user",
+                "modification": "adjust validation flow",
+            }
+
+            with patch(
+                "blast_analyzer._infer_intent_with_gemini_attempt",
+                side_effect=[(invalid, json.dumps(invalid)), (valid, json.dumps(valid))],
+            ) as mocked:
+                raw = blast_analyzer.load_intent(args, self.analyzer)
+
+            self.assertEqual(raw, valid)
+            self.assertEqual(mocked.call_count, 2)
+
+    def test_load_intent_from_gemini_falls_back_to_default_in_non_interactive_mode(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            change_file = Path(tmpdir) / "client.diff"
+            change_file.write_text("client contract update", encoding="utf-8")
+            args = self._gemini_args(str(change_file))
+
+            with patch(
+                "blast_analyzer._infer_intent_with_gemini_attempt",
+                side_effect=[ValueError("bad response"), ValueError("still bad")],
+            ):
+                with patch("sys.stdin.isatty", return_value=False):
+                    raw = blast_analyzer.load_intent(args, self.analyzer)
+
+            self.assertEqual(raw, blast_analyzer._default_intent())
+
+    def test_load_intent_from_gemini_invalid_target_reports_clear_error(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            change_file = Path(tmpdir) / "client.diff"
+            change_file.write_text("client contract update", encoding="utf-8")
+            args = self._gemini_args(str(change_file))
+
+            invalid = {
+                "change_type": "function_logic_change",
+                "target": "function:does.not.exist",
+                "modification": "adjust validation flow",
+            }
+
+            with patch(
+                "blast_analyzer._infer_intent_with_gemini_attempt",
+                side_effect=[(invalid, json.dumps(invalid)), (invalid, json.dumps(invalid))],
+            ):
+                with self.assertRaises(ValueError) as ctx:
+                    blast_analyzer._load_intent_from_gemini(args, self.analyzer)
+
+            message = str(ctx.exception)
+            self.assertIn("Gemini intent inference failed after 2 attempts", message)
+            self.assertIn("Target 'function:does.not.exist' not found in graph.", message)
 
 
 if __name__ == "__main__":

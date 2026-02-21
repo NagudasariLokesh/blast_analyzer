@@ -397,6 +397,8 @@ class BlastRadiusAnalyzer:
         if raw_target in self.graph:
             return raw_target
         if not self.allow_symbol_target:
+            if ":" in raw_target:
+                raise ValueError(f"Target '{raw_target}' not found in graph.")
             raise ValueError("Target must be fully-qualified node ID.")
 
         matches = []
@@ -845,11 +847,33 @@ def _gemini_prompt_target_context(analyzer: BlastRadiusAnalyzer) -> str:
     return "\n".join(lines)
 
 
-def infer_intent_with_gemini(
+def _gemini_prompt(change_payload: str, analyzer: BlastRadiusAnalyzer, strict_mode: bool) -> str:
+    strict_section = ""
+    if strict_mode:
+        strict_section = (
+            "Strict mode:\n"
+            "- target must exactly match one of the listed target IDs.\n"
+            "- do not invent target IDs.\n"
+            "- output must be one JSON object only.\n\n"
+        )
+    return (
+        "Convert the client code change below into one blast-radius intent JSON object.\n"
+        "Return only JSON.\n"
+        "Required keys: change_type, target, modification.\n"
+        f"Allowed change_type values: {sorted(SUPPORTED_CHANGE_TYPES)}\n\n"
+        f"{strict_section}"
+        f"{_gemini_prompt_target_context(analyzer)}\n\n"
+        "Client change:\n"
+        f"{change_payload}"
+    )
+
+
+def _infer_intent_with_gemini_attempt(
     change_text: str,
     analyzer: BlastRadiusAnalyzer,
     model: str = DEFAULT_GEMINI_MODEL,
-) -> Dict[str, Any]:
+    strict_mode: bool = False,
+) -> Tuple[Dict[str, Any], str]:
     _require_gemini_sdk()
     api_key = _require_gemini_api_key()
 
@@ -857,20 +881,10 @@ def infer_intent_with_gemini(
     if not change_payload:
         raise ValueError("Client change text is empty; cannot infer intent with Gemini.")
 
-    prompt = (
-        "Convert the client code change below into one blast-radius intent JSON object.\n"
-        "Return only JSON.\n"
-        "Required keys: change_type, target, modification.\n"
-        f"Allowed change_type values: {sorted(SUPPORTED_CHANGE_TYPES)}\n\n"
-        f"{_gemini_prompt_target_context(analyzer)}\n\n"
-        "Client change:\n"
-        f"{change_payload}"
-    )
-
     client = gemini_genai.Client(api_key=api_key)
     response = client.models.generate_content(
         model=model,
-        contents=prompt,
+        contents=_gemini_prompt(change_payload, analyzer, strict_mode=strict_mode),
         config={
             "response_mime_type": "application/json",
             "response_json_schema": _gemini_intent_json_schema(),
@@ -884,6 +898,20 @@ def infer_intent_with_gemini(
     parsed = json.loads(response_text)
     if not isinstance(parsed, dict):
         raise ValueError("Gemini response must be a JSON object.")
+    return parsed, response_text
+
+
+def infer_intent_with_gemini(
+    change_text: str,
+    analyzer: BlastRadiusAnalyzer,
+    model: str = DEFAULT_GEMINI_MODEL,
+) -> Dict[str, Any]:
+    parsed, _ = _infer_intent_with_gemini_attempt(
+        change_text=change_text,
+        analyzer=analyzer,
+        model=model,
+        strict_mode=False,
+    )
     return parsed
 
 
@@ -947,12 +975,7 @@ def _build_interactive_intent(_analyzer: BlastRadiusAnalyzer) -> Dict[str, Any]:
             print(exc)
 
 
-def load_intent(args: argparse.Namespace, analyzer: BlastRadiusAnalyzer) -> Dict[str, Any]:
-    if args.intent_json:
-        return json.loads(args.intent_json)
-    if args.intent_file:
-        with open(args.intent_file, "r", encoding="utf-8") as handle:
-            return json.load(handle)
+def _load_default_or_interactive_intent(analyzer: BlastRadiusAnalyzer) -> Dict[str, Any]:
     if not sys.stdin.isatty():
         print(
             "No --intent-json or --intent-file provided in non-interactive mode; "
@@ -966,6 +989,57 @@ def load_intent(args: argparse.Namespace, analyzer: BlastRadiusAnalyzer) -> Dict
     except EOFError:
         print("Input stream closed; using default sample intent.")
         return _default_intent()
+
+
+def _load_intent_from_gemini(args: argparse.Namespace, analyzer: BlastRadiusAnalyzer) -> Dict[str, Any]:
+    if not args.client_change_file:
+        raise ValueError("--client-change-file is required when --intent-from-gemini is set.")
+
+    with open(args.client_change_file, "r", encoding="utf-8") as handle:
+        change_text = handle.read()
+    if not change_text.strip():
+        raise ValueError(f"Client change file '{args.client_change_file}' is empty.")
+
+    errors: List[str] = []
+    for strict_mode in (False, True):
+        try:
+            parsed, raw_response = _infer_intent_with_gemini_attempt(
+                change_text=change_text,
+                analyzer=analyzer,
+                model=args.gemini_model,
+                strict_mode=strict_mode,
+            )
+            if args.gemini_debug:
+                label = "strict-retry" if strict_mode else "initial"
+                print(f"\n[gemini-debug] raw response ({label}):")
+                print(raw_response)
+            # Validate here so retry/fallback can handle semantic errors early.
+            analyzer.validate_and_normalize_intent(parsed)
+            return parsed
+        except (ValueError, json.JSONDecodeError) as exc:
+            label = "strict-retry" if strict_mode else "initial"
+            errors.append(f"{label} failed: {exc}")
+
+    raise ValueError(
+        "Gemini intent inference failed after 2 attempts. " + " | ".join(errors)
+    )
+
+
+def load_intent(args: argparse.Namespace, analyzer: BlastRadiusAnalyzer) -> Dict[str, Any]:
+    if args.intent_json:
+        return json.loads(args.intent_json)
+    if args.intent_file:
+        with open(args.intent_file, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    if args.intent_from_gemini:
+        try:
+            return _load_intent_from_gemini(args, analyzer)
+        except (ValueError, json.JSONDecodeError) as exc:
+            print(f"Gemini intent inference failed: {exc}")
+            print("Falling back to interactive/default intent input.")
+            return _load_default_or_interactive_intent(analyzer)
+
+    return _load_default_or_interactive_intent(analyzer)
 
 
 def report_to_markdown(report: Dict[str, Any]) -> str:
@@ -1005,6 +1079,7 @@ def report_to_markdown(report: Dict[str, Any]) -> str:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Blast radius analyzer")
+    default_gemini_model = os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
     parser.add_argument("--project-path", default="project", help="Path to Python project")
     parser.add_argument(
         "--allow-symbol-target",
@@ -1024,8 +1099,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--gemini-model",
-        default=DEFAULT_GEMINI_MODEL,
-        help=f"Gemini model for intent inference (default: {DEFAULT_GEMINI_MODEL})",
+        default=default_gemini_model,
+        help=(
+            "Gemini model for intent inference "
+            f"(default: {default_gemini_model}; env: GEMINI_MODEL)"
+        ),
+    )
+    parser.add_argument(
+        "--gemini-debug",
+        action="store_true",
+        help="Print raw Gemini response before parsing/validation",
     )
     parser.add_argument(
         "--list-targets",

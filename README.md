@@ -61,6 +61,41 @@ To see valid target IDs before selecting:
 python3 blast_analyzer.py --project-path project --list-targets
 ```
 
+## Gemini intent inference
+
+You can infer the change intent from a client-side diff/change file using Gemini.
+
+Set API key:
+
+```bash
+export GEMINI_API_KEY="your_api_key"
+```
+
+Optional model pin (or use `--gemini-model`):
+
+```bash
+export GEMINI_MODEL="gemini-2.0-flash"
+```
+
+Run:
+
+```bash
+python3 blast_analyzer.py \
+  --project-path project \
+  --intent-from-gemini \
+  --client-change-file client_change.diff
+```
+
+Optional debug output for raw model response:
+
+```bash
+python3 blast_analyzer.py \
+  --project-path project \
+  --intent-from-gemini \
+  --client-change-file client_change.diff \
+  --gemini-debug
+```
+
 Outputs:
 
 - `blast_report.json`
