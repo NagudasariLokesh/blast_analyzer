@@ -2,6 +2,7 @@ import argparse
 import ast
 import json
 import os
+import sys
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
@@ -733,34 +734,130 @@ def _format_edge(src: str, dst: str, graph: nx.DiGraph) -> str:
     return f"{src_name} → {dst_name}"
 
 
-def load_intent(args: argparse.Namespace) -> Dict[str, Any]:
+def _default_intent() -> Dict[str, str]:
+    return {
+        "change_type": "function_logic_change",
+        "target": "function:services.user_service.create_user",
+        "modification": "adjust validation flow",
+    }
+
+
+def _intent_target_candidates(analyzer: BlastRadiusAnalyzer, change_type: str) -> List[str]:
+    candidates: List[str] = []
+    for node_id, data in analyzer.graph.nodes(data=True):
+        node_type = data.get("type", "")
+        module_name = data.get("module", "")
+        node_name = str(data.get("name", "")).lower()
+
+        if change_type == "api_modification":
+            if node_type == "api" or (node_type == "function" and analyzer._is_api_function(data)):
+                candidates.append(node_id)
+            continue
+
+        if change_type == "validation_rule_change":
+            if node_type == "function" and (
+                "validate" in node_name or "validation" in module_name
+            ):
+                candidates.append(node_id)
+            continue
+
+        if change_type == "data_model_change":
+            if node_type in {"class", "data_entity"} or module_name.startswith("models."):
+                candidates.append(node_id)
+            continue
+
+        if change_type in {"function_logic_change", "refactor_shared_method"} and node_type == "function":
+            candidates.append(node_id)
+
+    return sorted(
+        candidates,
+        key=lambda node_id: (
+            analyzer.graph.nodes[node_id].get("module", ""),
+            analyzer.graph.nodes[node_id].get("name", ""),
+            node_id,
+        ),
+    )
+
+
+def _parse_single_line_intent(raw_text: str) -> Dict[str, Any]:
+    text = raw_text.strip()
+    if not text:
+        return _default_intent()
+
+    if text.startswith("{"):
+        parsed = json.loads(text)
+        if not isinstance(parsed, dict):
+            raise ValueError("Intent JSON must be an object.")
+        return parsed
+
+    if "|" in text:
+        parts = [part.strip() for part in text.split("|", 2)]
+        if len(parts) != 3 or not all(parts):
+            raise ValueError(
+                "Pipe format must be: change_type|target|modification"
+            )
+        return {
+            "change_type": parts[0],
+            "target": parts[1],
+            "modification": parts[2],
+        }
+
+    tokens = text.split()
+    if len(tokens) >= 3 and tokens[0].strip().lower() in SUPPORTED_CHANGE_TYPES:
+        return {
+            "change_type": tokens[0],
+            "target": tokens[1],
+            "modification": " ".join(tokens[2:]),
+        }
+
+    raise ValueError(
+        "Unsupported input format. Use JSON, "
+        "'change_type|target|modification', or "
+        "'<change_type> <target> <modification...>'."
+    )
+
+
+def _build_interactive_intent(_analyzer: BlastRadiusAnalyzer) -> Dict[str, Any]:
+    print("\nEnter change intent as one line.")
+    print("Accepted formats:")
+    print("1. change_type|target|modification")
+    print("2. <change_type> <target> <modification...>")
+    print("3. {\"change_type\":\"...\",\"target\":\"...\",\"modification\":\"...\"}")
+    print("Tip: run with --list-targets to see valid target IDs.")
+    print("Press Enter to use default sample intent.")
+
+    while True:
+        raw = input("Intent: ")
+        if not raw.strip():
+            print("Empty input; using default sample intent.")
+            return _default_intent()
+        try:
+            return _parse_single_line_intent(raw)
+        except json.JSONDecodeError as exc:
+            print(f"Invalid JSON input: {exc}")
+        except ValueError as exc:
+            print(exc)
+
+
+def load_intent(args: argparse.Namespace, analyzer: BlastRadiusAnalyzer) -> Dict[str, Any]:
     if args.intent_json:
         return json.loads(args.intent_json)
     if args.intent_file:
         with open(args.intent_file, "r", encoding="utf-8") as handle:
             return json.load(handle)
+    if not sys.stdin.isatty():
+        print(
+            "No --intent-json or --intent-file provided in non-interactive mode; "
+            "using default sample intent."
+        )
+        return _default_intent()
 
-    print("\n" + _header("CHANGE INTENT INPUT"))
-    print("\nEnter Change Type:")
-    print("1. api_modification")
-    print("2. validation_rule_change")
-    print("3. refactor_shared_method")
-    print("4. function_logic_change")
-    print("5. data_model_change")
-    choice = input("Select (1/2/3/4/5): ").strip()
-    mapping = {
-        "1": "api_modification",
-        "2": "validation_rule_change",
-        "3": "refactor_shared_method",
-        "4": "function_logic_change",
-        "5": "data_model_change",
-    }
-    change_type = mapping.get(choice)
-    if not change_type:
-        raise ValueError("Invalid choice.")
-    target = input("Enter target node id or symbol name: ").strip()
-    modification = input("Describe the modification: ").strip()
-    return {"change_type": change_type, "target": target, "modification": modification}
+    try:
+        print("\n" + _header("CHANGE INTENT INPUT"))
+        return _build_interactive_intent(analyzer)
+    except EOFError:
+        print("Input stream closed; using default sample intent.")
+        return _default_intent()
 
 
 def report_to_markdown(report: Dict[str, Any]) -> str:
@@ -808,9 +905,31 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--intent-file", help="Path to JSON file containing change intent")
     parser.add_argument("--intent-json", help="Inline JSON string containing change intent")
+    parser.add_argument(
+        "--list-targets",
+        action="store_true",
+        help="List valid target node IDs by change type and exit",
+    )
     parser.add_argument("--output-json", default="blast_report.json", help="JSON report output path")
     parser.add_argument("--output-md", default="blast_report.md", help="Markdown report output path")
     return parser.parse_args()
+
+
+def _print_targets_by_change_type(analyzer: BlastRadiusAnalyzer) -> None:
+    print("Available target node IDs:\n")
+    ordered_types = [
+        "function_logic_change",
+        "api_modification",
+        "validation_rule_change",
+        "refactor_shared_method",
+        "data_model_change",
+    ]
+    for change_type in ordered_types:
+        print(f"{change_type}:")
+        for node_id in _intent_target_candidates(analyzer, change_type):
+            data = analyzer.graph.nodes[node_id]
+            print(f"  - {node_id}  ({data.get('name', node_id)} | module={data.get('module', 'unknown')})")
+        print("")
 
 
 def main() -> int:
@@ -820,11 +939,14 @@ def main() -> int:
         allow_symbol_target=args.allow_symbol_target,
     )
     analyzer.build_graph()
+    if args.list_targets:
+        _print_targets_by_change_type(analyzer)
+        return 0
 
     try:
-        raw_intent = load_intent(args)
+        raw_intent = load_intent(args, analyzer)
         intent, target_node = analyzer.validate_and_normalize_intent(raw_intent)
-    except (ValueError, json.JSONDecodeError) as exc:
+    except (ValueError, json.JSONDecodeError, EOFError) as exc:
         print(f"ERROR: {exc}")
         return 1
 
