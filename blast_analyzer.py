@@ -9,6 +9,11 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import networkx as nx
 
+try:
+    from google import genai as gemini_genai
+except ImportError:  # pragma: no cover - optional dependency for Gemini integration
+    gemini_genai = None
+
 
 SUPPORTED_CHANGE_TYPES = {
     "api_modification",
@@ -17,6 +22,13 @@ SUPPORTED_CHANGE_TYPES = {
     "refactor_shared_method",
     "data_model_change",
 }
+ORDERED_CHANGE_TYPES = [
+    "function_logic_change",
+    "api_modification",
+    "validation_rule_change",
+    "refactor_shared_method",
+    "data_model_change",
+]
 
 CONTRACT_BREAK_PATTERNS = (
     "remove",
@@ -29,6 +41,7 @@ CONTRACT_BREAK_PATTERNS = (
     "change signature",
 )
 DEPENDENCY_RELATIONS = {"CALLS", "DEPENDS_ON", "INHERITS", "READS", "WRITES", "RETURNS"}
+DEFAULT_GEMINI_MODEL = "gemini-2.0-flash"
 
 
 @dataclass
@@ -781,6 +794,99 @@ def _intent_target_candidates(analyzer: BlastRadiusAnalyzer, change_type: str) -
     )
 
 
+def _require_gemini_sdk() -> None:
+    if gemini_genai is None:
+        raise ValueError(
+            "Gemini SDK not installed. Install it with: pip install -U google-genai"
+        )
+
+
+def _require_gemini_api_key() -> str:
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        raise ValueError("Missing GEMINI_API_KEY environment variable.")
+    return api_key
+
+
+def _gemini_intent_json_schema() -> Dict[str, Any]:
+    return {
+        "type": "object",
+        "required": ["change_type", "target", "modification"],
+        "additionalProperties": True,
+        "properties": {
+            "change_type": {
+                "type": "string",
+                "enum": sorted(SUPPORTED_CHANGE_TYPES),
+            },
+            "target": {"type": "string"},
+            "modification": {"type": "string"},
+        },
+    }
+
+
+def _gemini_target_candidates_by_change_type(analyzer: BlastRadiusAnalyzer) -> Dict[str, List[str]]:
+    return {
+        change_type: _intent_target_candidates(analyzer, change_type)
+        for change_type in ORDERED_CHANGE_TYPES
+    }
+
+
+def _gemini_prompt_target_context(analyzer: BlastRadiusAnalyzer) -> str:
+    lines = ["Valid target IDs grouped by change_type:"]
+    grouped_targets = _gemini_target_candidates_by_change_type(analyzer)
+    for change_type in ORDERED_CHANGE_TYPES:
+        lines.append(f"{change_type}:")
+        candidates = grouped_targets.get(change_type, [])
+        if not candidates:
+            lines.append("  - <none>")
+            continue
+        for node_id in candidates:
+            lines.append(f"  - {node_id}")
+    return "\n".join(lines)
+
+
+def infer_intent_with_gemini(
+    change_text: str,
+    analyzer: BlastRadiusAnalyzer,
+    model: str = DEFAULT_GEMINI_MODEL,
+) -> Dict[str, Any]:
+    _require_gemini_sdk()
+    api_key = _require_gemini_api_key()
+
+    change_payload = (change_text or "").strip()
+    if not change_payload:
+        raise ValueError("Client change text is empty; cannot infer intent with Gemini.")
+
+    prompt = (
+        "Convert the client code change below into one blast-radius intent JSON object.\n"
+        "Return only JSON.\n"
+        "Required keys: change_type, target, modification.\n"
+        f"Allowed change_type values: {sorted(SUPPORTED_CHANGE_TYPES)}\n\n"
+        f"{_gemini_prompt_target_context(analyzer)}\n\n"
+        "Client change:\n"
+        f"{change_payload}"
+    )
+
+    client = gemini_genai.Client(api_key=api_key)
+    response = client.models.generate_content(
+        model=model,
+        contents=prompt,
+        config={
+            "response_mime_type": "application/json",
+            "response_json_schema": _gemini_intent_json_schema(),
+        },
+    )
+
+    response_text = getattr(response, "text", "")
+    if not response_text or not response_text.strip():
+        raise ValueError("Gemini returned an empty response.")
+
+    parsed = json.loads(response_text)
+    if not isinstance(parsed, dict):
+        raise ValueError("Gemini response must be a JSON object.")
+    return parsed
+
+
 def _parse_single_line_intent(raw_text: str) -> Dict[str, Any]:
     text = raw_text.strip()
     if not text:
@@ -908,6 +1014,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--intent-file", help="Path to JSON file containing change intent")
     parser.add_argument("--intent-json", help="Inline JSON string containing change intent")
     parser.add_argument(
+        "--intent-from-gemini",
+        action="store_true",
+        help="Infer change intent from client change text using Gemini",
+    )
+    parser.add_argument(
+        "--client-change-file",
+        help="Path to file containing client-side code changes/diff for Gemini intent inference",
+    )
+    parser.add_argument(
+        "--gemini-model",
+        default=DEFAULT_GEMINI_MODEL,
+        help=f"Gemini model for intent inference (default: {DEFAULT_GEMINI_MODEL})",
+    )
+    parser.add_argument(
         "--list-targets",
         action="store_true",
         help="List valid target node IDs by change type and exit",
@@ -919,14 +1039,7 @@ def parse_args() -> argparse.Namespace:
 
 def _print_targets_by_change_type(analyzer: BlastRadiusAnalyzer) -> None:
     print("Available target node IDs:\n")
-    ordered_types = [
-        "function_logic_change",
-        "api_modification",
-        "validation_rule_change",
-        "refactor_shared_method",
-        "data_model_change",
-    ]
-    for change_type in ordered_types:
+    for change_type in ORDERED_CHANGE_TYPES:
         print(f"{change_type}:")
         for node_id in _intent_target_candidates(analyzer, change_type):
             data = analyzer.graph.nodes[node_id]
