@@ -1,21 +1,21 @@
 {
   "change": {
     "change_type": "data_model_change",
+    "modification": "add optional nickname field to user create endpoint request payload.",
     "target": "data:request.get",
-    "target_display": "request.get",
-    "modification": "add optional nickname field to user create endpoint request payload"
+    "target_display": "request.get"
   },
   "direct_impacts": [
     {
-      "component": "function:api.user_api.post_user",
-      "name": "post_user",
-      "component_type": "function",
-      "module": "api.user_api",
-      "impact_type": "Direct",
       "category": "Data Handling",
+      "component": "function:api.user_api.post_user",
+      "component_type": "function",
       "dependency_types": [
         "READS"
       ],
+      "impact_type": "Direct",
+      "module": "api.user_api",
+      "name": "post_user",
       "path": [
         "data:request.get",
         "function:api.user_api.post_user"
@@ -29,10 +29,10 @@
     "Unknown test coverage for impacted components.",
     "Data model change can propagate through mappings and persistence boundaries."
   ],
+  "severity": "medium",
   "unknown_impact_zones": [
     "Unresolved symbol: app.route",
     "Unresolved symbol: print",
     "Unresolved symbol: request.get"
-  ],
-  "severity": "medium"
+  ]
 }

@@ -3,7 +3,7 @@
 ## Change Summary
 - Change Type: `data_model_change`
 - Target: `data:request.get`
-- Modification: `add optional nickname field to user create endpoint request payload`
+- Modification: `add optional nickname field to user create endpoint request payload.`
 
 ## Direct Impacts
 - `function:api.user_api.post_user` (Data Handling): Impact propagates via relations [READS] along path: request.get -> post_user

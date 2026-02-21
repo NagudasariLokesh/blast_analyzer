@@ -1,9 +1,12 @@
 import argparse
 import ast
+import hashlib
 import json
 import os
+import sqlite3
 import sys
 from collections import defaultdict, deque
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
@@ -52,6 +55,9 @@ DEPENDENCY_RELATIONS = {"CALLS", "DEPENDS_ON", "INHERITS", "READS", "WRITES", "R
 DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
 DEFAULT_OPENAI_TIMEOUT_SECONDS = 20
 DEFAULT_OPENAI_MAX_RETRIES = 2
+DEFAULT_CACHE_DB = ".blast_cache.sqlite3"
+PROMPT_VERSION = "openai-intent-v1"
+ANALYZER_VERSION = "blast-analyzer-v1"
 
 
 @dataclass
@@ -82,6 +88,148 @@ class ChangeIntent:
 
         metadata = {k: v for k, v in raw.items() if k not in {"change_type", "target", "modification"}}
         return cls(change_type=change_type, target=target, modification=modification, metadata=metadata)
+
+
+@dataclass(frozen=True)
+class CacheKey:
+    codebase_hash: str
+    client_change_hash: str
+    openai_model: str
+    prompt_version: str
+    analyzer_version: str
+
+
+class AnalysisCache:
+    def __init__(self, db_path: str) -> None:
+        self.db_path = db_path
+
+    def initialize(self) -> None:
+        db_dir = os.path.dirname(self.db_path)
+        if db_dir:
+            os.makedirs(db_dir, exist_ok=True)
+        with self._connect() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS analysis_cache (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    codebase_hash TEXT NOT NULL,
+                    client_change_hash TEXT NOT NULL,
+                    openai_model TEXT NOT NULL,
+                    prompt_version TEXT NOT NULL,
+                    analyzer_version TEXT NOT NULL,
+                    inferred_intent_json TEXT NOT NULL,
+                    report_json TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    error_message TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    last_accessed_at TEXT NOT NULL,
+                    hit_count INTEGER NOT NULL DEFAULT 0,
+                    UNIQUE (
+                        codebase_hash,
+                        client_change_hash,
+                        openai_model,
+                        prompt_version,
+                        analyzer_version
+                    )
+                )
+                """
+            )
+
+    def fetch_success(self, key: CacheKey) -> Optional[Tuple[Dict[str, Any], Dict[str, Any]]]:
+        now = _utc_now_iso()
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id, inferred_intent_json, report_json
+                FROM analysis_cache
+                WHERE
+                    codebase_hash = ?
+                    AND client_change_hash = ?
+                    AND openai_model = ?
+                    AND prompt_version = ?
+                    AND analyzer_version = ?
+                    AND status = 'success'
+                LIMIT 1
+                """,
+                (
+                    key.codebase_hash,
+                    key.client_change_hash,
+                    key.openai_model,
+                    key.prompt_version,
+                    key.analyzer_version,
+                ),
+            ).fetchone()
+            if row is None:
+                return None
+
+            conn.execute(
+                """
+                UPDATE analysis_cache
+                SET
+                    hit_count = hit_count + 1,
+                    last_accessed_at = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (now, now, row["id"]),
+            )
+            return json.loads(row["inferred_intent_json"]), json.loads(row["report_json"])
+
+    def upsert_success(self, key: CacheKey, raw_intent: Dict[str, Any], report: Dict[str, Any]) -> None:
+        now = _utc_now_iso()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO analysis_cache (
+                    codebase_hash,
+                    client_change_hash,
+                    openai_model,
+                    prompt_version,
+                    analyzer_version,
+                    inferred_intent_json,
+                    report_json,
+                    status,
+                    error_message,
+                    created_at,
+                    updated_at,
+                    last_accessed_at,
+                    hit_count
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'success', NULL, ?, ?, ?, 0)
+                ON CONFLICT (
+                    codebase_hash,
+                    client_change_hash,
+                    openai_model,
+                    prompt_version,
+                    analyzer_version
+                )
+                DO UPDATE SET
+                    inferred_intent_json = excluded.inferred_intent_json,
+                    report_json = excluded.report_json,
+                    status = 'success',
+                    error_message = NULL,
+                    updated_at = excluded.updated_at,
+                    last_accessed_at = excluded.last_accessed_at
+                """,
+                (
+                    key.codebase_hash,
+                    key.client_change_hash,
+                    key.openai_model,
+                    key.prompt_version,
+                    key.analyzer_version,
+                    json.dumps(raw_intent, sort_keys=True),
+                    json.dumps(report, sort_keys=True),
+                    now,
+                    now,
+                    now,
+                ),
+            )
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
 
 
 class BlastRadiusAnalyzer:
@@ -806,6 +954,59 @@ def _intent_target_candidates(analyzer: BlastRadiusAnalyzer, change_type: str) -
     )
 
 
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _hash_file_bytes(file_path: str) -> str:
+    hasher = hashlib.sha256()
+    with open(file_path, "rb") as handle:
+        while True:
+            chunk = handle.read(65536)
+            if not chunk:
+                break
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def _project_codebase_hash(project_path: str) -> str:
+    hasher = hashlib.sha256()
+    file_paths: List[str] = []
+    for root, _dirs, files in os.walk(project_path):
+        for file_name in files:
+            if file_name.endswith(".py"):
+                file_paths.append(os.path.join(root, file_name))
+
+    for file_path in sorted(file_paths):
+        rel_path = os.path.relpath(file_path, project_path).replace(os.sep, "/")
+        hasher.update(rel_path.encode("utf-8"))
+        hasher.update(b"\0")
+        with open(file_path, "rb") as handle:
+            while True:
+                chunk = handle.read(65536)
+                if not chunk:
+                    break
+                hasher.update(chunk)
+        hasher.update(b"\0")
+
+    return hasher.hexdigest()
+
+
+def _build_cache_key(args: argparse.Namespace) -> CacheKey:
+    if not args.client_change_file:
+        raise ValueError("--client-change-file is required when --intent-from-openai is set.")
+
+    codebase_hash = _project_codebase_hash(args.project_path)
+    client_change_hash = _hash_file_bytes(args.client_change_file)
+    return CacheKey(
+        codebase_hash=codebase_hash,
+        client_change_hash=client_change_hash,
+        openai_model=args.openai_model,
+        prompt_version=PROMPT_VERSION,
+        analyzer_version=ANALYZER_VERSION,
+    )
+
+
 def _require_openai_sdk() -> None:
     if OpenAI is None:
         raise ValueError(
@@ -1071,21 +1272,26 @@ def _load_intent_from_openai(args: argparse.Namespace, analyzer: BlastRadiusAnal
     )
 
 
-def load_intent(args: argparse.Namespace, analyzer: BlastRadiusAnalyzer) -> Dict[str, Any]:
+def load_intent_with_source(args: argparse.Namespace, analyzer: BlastRadiusAnalyzer) -> Tuple[Dict[str, Any], str]:
     if args.intent_json:
-        return json.loads(args.intent_json)
+        return json.loads(args.intent_json), "intent_json"
     if args.intent_file:
         with open(args.intent_file, "r", encoding="utf-8") as handle:
-            return json.load(handle)
+            return json.load(handle), "intent_file"
     if args.intent_from_openai:
         try:
-            return _load_intent_from_openai(args, analyzer)
+            return _load_intent_from_openai(args, analyzer), "openai"
         except (ValueError, json.JSONDecodeError) as exc:
             print(f"OpenAI intent inference failed: {exc}")
             print("Falling back to interactive/default intent input.")
-            return _load_default_or_interactive_intent(analyzer)
+            return _load_default_or_interactive_intent(analyzer), "fallback"
 
-    return _load_default_or_interactive_intent(analyzer)
+    return _load_default_or_interactive_intent(analyzer), "default_or_interactive"
+
+
+def load_intent(args: argparse.Namespace, analyzer: BlastRadiusAnalyzer) -> Dict[str, Any]:
+    raw_intent, _ = load_intent_with_source(args, analyzer)
+    return raw_intent
 
 
 def report_to_markdown(report: Dict[str, Any]) -> str:
@@ -1126,6 +1332,7 @@ def report_to_markdown(report: Dict[str, Any]) -> str:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Blast radius analyzer")
     default_openai_model = os.getenv("OPENAI_MODEL", DEFAULT_OPENAI_MODEL)
+    default_cache_db = os.getenv("BLAST_CACHE_DB", DEFAULT_CACHE_DB)
     parser.add_argument("--project-path", default="project", help="Path to Python project")
     parser.add_argument(
         "--allow-symbol-target",
@@ -1157,6 +1364,19 @@ def parse_args() -> argparse.Namespace:
         help="Print raw OpenAI response before parsing/validation",
     )
     parser.add_argument(
+        "--cache-db",
+        default=default_cache_db,
+        help=(
+            "SQLite cache path for OpenAI intent/report reuse "
+            f"(default: {default_cache_db}; env: BLAST_CACHE_DB)"
+        ),
+    )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Disable SQLite cache for --intent-from-openai runs",
+    )
+    parser.add_argument(
         "--list-targets",
         action="store_true",
         help="List valid target node IDs by change type and exit",
@@ -1176,32 +1396,21 @@ def _print_targets_by_change_type(analyzer: BlastRadiusAnalyzer) -> None:
         print("")
 
 
-def main() -> int:
-    args = parse_args()
-    analyzer = BlastRadiusAnalyzer(
-        project_path=args.project_path,
-        allow_symbol_target=args.allow_symbol_target,
-    )
-    analyzer.build_graph()
-    if args.list_targets:
-        _print_targets_by_change_type(analyzer)
-        return 0
-
-    try:
-        raw_intent = load_intent(args, analyzer)
-        intent, target_node = analyzer.validate_and_normalize_intent(raw_intent)
-    except (ValueError, json.JSONDecodeError, EOFError) as exc:
-        print(f"ERROR: {exc}")
-        return 1
-
-    report = analyzer.generate_report(intent, target_node)
-
+def _write_report_outputs(args: argparse.Namespace, report: Dict[str, Any]) -> None:
     with open(args.output_json, "w", encoding="utf-8") as handle:
         json.dump(report, handle, indent=2)
 
     with open(args.output_md, "w", encoding="utf-8") as handle:
         handle.write(report_to_markdown(report))
 
+
+def _print_report_console(
+    analyzer: BlastRadiusAnalyzer,
+    args: argparse.Namespace,
+    report: Dict[str, Any],
+    intent: ChangeIntent,
+    target_node: str,
+) -> None:
     label_map = {
         "api_modification": "API_CHANGE",
         "validation_rule_change": "VALIDATION_CHANGE",
@@ -1257,7 +1466,7 @@ def main() -> int:
     print("\nTraceability Paths:\n")
     for item in items_sorted:
         path_names = [analyzer.graph.nodes[n].get("name", n) for n in item["path"]]
-        print(" → ".join(path_names))
+        print(" -> ".join(path_names))
 
     api_impacted = any(
         item.get("component_type") == "api" or item.get("module", "").startswith("api.")
@@ -1272,6 +1481,78 @@ def main() -> int:
     print(f"API Impacted: {api_impacted}")
     print(f"Data Layer Impacted: {data_impacted}")
     print("External Dependencies Impacted: False")
+
+
+def main() -> int:
+    args = parse_args()
+    analyzer = BlastRadiusAnalyzer(
+        project_path=args.project_path,
+        allow_symbol_target=args.allow_symbol_target,
+    )
+    analyzer.build_graph()
+    if args.list_targets:
+        _print_targets_by_change_type(analyzer)
+        return 0
+
+    cache: Optional[AnalysisCache] = None
+    cache_key: Optional[CacheKey] = None
+    if args.intent_from_openai and not args.no_cache:
+        try:
+            cache = AnalysisCache(args.cache_db)
+            cache.initialize()
+            cache_key = _build_cache_key(args)
+            cached_payload = cache.fetch_success(cache_key)
+            if cached_payload is not None:
+                raw_cached_intent, cached_report = cached_payload
+                if not isinstance(raw_cached_intent, dict) or not isinstance(cached_report, dict):
+                    raise ValueError("Cached payload is malformed.")
+                intent, target_node = analyzer.validate_and_normalize_intent(raw_cached_intent)
+                _write_report_outputs(args, cached_report)
+                print(f"Cache hit: {args.cache_db}")
+                _print_report_console(
+                    analyzer=analyzer,
+                    args=args,
+                    report=cached_report,
+                    intent=intent,
+                    target_node=target_node,
+                )
+                return 0
+        except (
+            OSError,
+            sqlite3.Error,
+            ValueError,
+            json.JSONDecodeError,
+            EOFError,
+            KeyError,
+        ) as exc:
+            print(f"Cache unavailable; continuing without cache: {exc}")
+            cache = None
+            cache_key = None
+
+    try:
+        raw_intent, intent_source = load_intent_with_source(args, analyzer)
+        intent, target_node = analyzer.validate_and_normalize_intent(raw_intent)
+    except (ValueError, json.JSONDecodeError, EOFError) as exc:
+        print(f"ERROR: {exc}")
+        return 1
+
+    report = analyzer.generate_report(intent, target_node)
+    _write_report_outputs(args, report)
+
+    if cache is not None and cache_key is not None and intent_source == "openai":
+        try:
+            cache.upsert_success(cache_key, raw_intent, report)
+            print(f"Cache updated: {args.cache_db}")
+        except (OSError, sqlite3.Error, ValueError, TypeError) as exc:
+            print(f"Warning: failed to persist cache entry: {exc}")
+
+    _print_report_console(
+        analyzer=analyzer,
+        args=args,
+        report=report,
+        intent=intent,
+        target_node=target_node,
+    )
     return 0
 
 

@@ -1,5 +1,6 @@
 import argparse
 import json
+import sqlite3
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -188,6 +189,51 @@ class BlastAnalyzerTests(unittest.TestCase):
             message = str(ctx.exception)
             self.assertIn("OpenAI intent inference failed after 2 attempts", message)
             self.assertIn("Target 'function:does.not.exist' not found in graph.", message)
+
+    def test_analysis_cache_round_trip_and_hit_count(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "blast_cache.sqlite3"
+            cache = blast_analyzer.AnalysisCache(str(db_path))
+            cache.initialize()
+            key = blast_analyzer.CacheKey(
+                codebase_hash="code-hash-1",
+                client_change_hash="diff-hash-1",
+                openai_model="gpt-4o-mini",
+                prompt_version="openai-intent-v1",
+                analyzer_version="blast-analyzer-v1",
+            )
+            raw_intent = {
+                "change_type": "function_logic_change",
+                "target": "function:services.user_service.create_user",
+                "modification": "adjust validation flow",
+            }
+            intent, target = self.analyzer.validate_and_normalize_intent(raw_intent)
+            report = self.analyzer.generate_report(intent, target)
+
+            cache.upsert_success(key, raw_intent, report)
+            first = cache.fetch_success(key)
+            second = cache.fetch_success(key)
+
+            self.assertIsNotNone(first)
+            self.assertIsNotNone(second)
+            cached_intent, cached_report = second or ({}, {})
+            self.assertEqual(cached_intent["target"], raw_intent["target"])
+            self.assertEqual(cached_report["change"]["target"], report["change"]["target"])
+
+            with sqlite3.connect(str(db_path)) as conn:
+                hit_count = conn.execute("SELECT hit_count FROM analysis_cache LIMIT 1").fetchone()[0]
+            self.assertEqual(hit_count, 2)
+
+    def test_project_codebase_hash_changes_when_python_file_changes(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            py_file = Path(tmpdir) / "sample.py"
+            py_file.write_text("def x():\n    return 1\n", encoding="utf-8")
+            first_hash = blast_analyzer._project_codebase_hash(tmpdir)
+
+            py_file.write_text("def x():\n    return 2\n", encoding="utf-8")
+            second_hash = blast_analyzer._project_codebase_hash(tmpdir)
+
+            self.assertNotEqual(first_hash, second_hash)
 
 
 if __name__ == "__main__":

@@ -99,6 +99,37 @@ python3 blast_analyzer.py \
 
 You can also export env vars directly in your shell instead of using `.env`.
 
+## SQLite cache (for repeat changes)
+
+OpenAI-backed runs are cached by:
+
+- codebase hash
+- client change file hash
+- OpenAI model
+- prompt/analyzer versions
+
+Default cache DB: `.blast_cache.sqlite3`
+
+Use a custom DB path:
+
+```bash
+python3 blast_analyzer.py \
+  --project-path project \
+  --intent-from-openai \
+  --client-change-file client_change.diff \
+  --cache-db /tmp/blast_cache.sqlite3
+```
+
+Disable cache:
+
+```bash
+python3 blast_analyzer.py \
+  --project-path project \
+  --intent-from-openai \
+  --client-change-file client_change.diff \
+  --no-cache
+```
+
 Outputs:
 
 - `blast_report.json`

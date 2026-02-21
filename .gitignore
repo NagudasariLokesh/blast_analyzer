@@ -27,6 +27,7 @@ buildenv/
 # Generated analyzer outputs
 blast_report.json
 blast_report.md
+.blast_cache.sqlite3
 
 # Editor and OS noise
 .vscode/
