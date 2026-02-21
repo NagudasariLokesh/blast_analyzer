@@ -15,7 +15,6 @@
 - `data:self.age` (Data Handling): Impact propagates via relations [DEPENDS_ON -> WRITES] along path: create_user -> User -> self.age
 - `data:self.username` (Data Handling): Impact propagates via relations [DEPENDS_ON -> WRITES] along path: create_user -> User -> self.username
 - `data:user.username` (Data Handling): Impact propagates via relations [CALLS -> READS] along path: create_user -> save_user -> user.username
-- `external:print` (Business Logic): Impact propagates via relations [CALLS -> CALLS] along path: create_user -> save_user -> print
 - `function:models.user_model.User.__init__` (Business Logic): Impact propagates via relations [DEPENDS_ON -> DEPENDS_ON] along path: create_user -> User -> __init__
 
 ## Risk Zones

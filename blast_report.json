@@ -127,24 +127,6 @@
       "reason": "Impact propagates via relations [CALLS -> READS] along path: create_user -> save_user -> user.username"
     },
     {
-      "component": "external:print",
-      "name": "print",
-      "component_type": "external",
-      "module": "external",
-      "impact_type": "Indirect",
-      "category": "Business Logic",
-      "dependency_types": [
-        "CALLS",
-        "CALLS"
-      ],
-      "path": [
-        "function:services.user_service.create_user",
-        "function:database.db.save_user",
-        "external:print"
-      ],
-      "reason": "Impact propagates via relations [CALLS -> CALLS] along path: create_user -> save_user -> print"
-    },
-    {
       "component": "function:models.user_model.User.__init__",
       "name": "__init__",
       "component_type": "function",
