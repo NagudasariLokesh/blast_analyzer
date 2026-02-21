@@ -61,20 +61,21 @@ To see valid target IDs before selecting:
 python3 blast_analyzer.py --project-path project --list-targets
 ```
 
-## Gemini intent inference
+## OpenAI intent inference
 
-You can infer the change intent from a client-side diff/change file using Gemini.
+You can infer the change intent from a client-side diff/change file using OpenAI.
 
-Set API key:
-
-```bash
-export GEMINI_API_KEY="your_api_key"
-```
-
-Optional model pin (or use `--gemini-model`):
+Recommended: configure a local `.env` file (auto-loaded at runtime):
 
 ```bash
-export GEMINI_MODEL="gemini-2.0-flash"
+cat > .env <<'EOF'
+OPENAI_API_KEY=sk-...
+OPENAI_MODEL=gpt-4o-mini
+OPENAI_ORG_ID=
+OPENAI_PROJECT_ID=
+OPENAI_TIMEOUT_SECONDS=20
+OPENAI_MAX_RETRIES=2
+EOF
 ```
 
 Run:
@@ -82,7 +83,7 @@ Run:
 ```bash
 python3 blast_analyzer.py \
   --project-path project \
-  --intent-from-gemini \
+  --intent-from-openai \
   --client-change-file client_change.diff
 ```
 
@@ -91,10 +92,12 @@ Optional debug output for raw model response:
 ```bash
 python3 blast_analyzer.py \
   --project-path project \
-  --intent-from-gemini \
+  --intent-from-openai \
   --client-change-file client_change.diff \
-  --gemini-debug
+  --openai-debug
 ```
+
+You can also export env vars directly in your shell instead of using `.env`.
 
 Outputs:
 

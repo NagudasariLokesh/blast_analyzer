@@ -10,9 +10,17 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 import networkx as nx
 
 try:
-    from google import genai as gemini_genai
-except ImportError:  # pragma: no cover - optional dependency for Gemini integration
-    gemini_genai = None
+    from openai import OpenAI
+except ImportError:  # pragma: no cover - optional dependency for OpenAI integration
+    OpenAI = None
+
+try:
+    from dotenv import load_dotenv
+except ImportError:  # pragma: no cover - optional dependency for .env loading
+    load_dotenv = None
+
+if load_dotenv is not None:
+    load_dotenv()
 
 
 SUPPORTED_CHANGE_TYPES = {
@@ -41,7 +49,9 @@ CONTRACT_BREAK_PATTERNS = (
     "change signature",
 )
 DEPENDENCY_RELATIONS = {"CALLS", "DEPENDS_ON", "INHERITS", "READS", "WRITES", "RETURNS"}
-DEFAULT_GEMINI_MODEL = "gemini-2.0-flash"
+DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
+DEFAULT_OPENAI_TIMEOUT_SECONDS = 20
+DEFAULT_OPENAI_MAX_RETRIES = 2
 
 
 @dataclass
@@ -796,25 +806,43 @@ def _intent_target_candidates(analyzer: BlastRadiusAnalyzer, change_type: str) -
     )
 
 
-def _require_gemini_sdk() -> None:
-    if gemini_genai is None:
+def _require_openai_sdk() -> None:
+    if OpenAI is None:
         raise ValueError(
-            "Gemini SDK not installed. Install it with: pip install -U google-genai"
+            "OpenAI SDK not installed. Install it with: pip install -U openai"
         )
 
 
-def _require_gemini_api_key() -> str:
-    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+def _require_openai_api_key() -> str:
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
-        raise ValueError("Missing GEMINI_API_KEY environment variable.")
+        raise ValueError("Missing OPENAI_API_KEY environment variable.")
     return api_key
 
 
-def _gemini_intent_json_schema() -> Dict[str, Any]:
+def _optional_env(name: str) -> Optional[str]:
+    value = os.getenv(name, "").strip()
+    return value or None
+
+
+def _int_env(name: str, default: int, minimum: int = 0) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer.") from exc
+    if value < minimum:
+        raise ValueError(f"{name} must be >= {minimum}.")
+    return value
+
+
+def _openai_intent_json_schema() -> Dict[str, Any]:
     return {
         "type": "object",
         "required": ["change_type", "target", "modification"],
-        "additionalProperties": True,
+        "additionalProperties": False,
         "properties": {
             "change_type": {
                 "type": "string",
@@ -826,16 +854,16 @@ def _gemini_intent_json_schema() -> Dict[str, Any]:
     }
 
 
-def _gemini_target_candidates_by_change_type(analyzer: BlastRadiusAnalyzer) -> Dict[str, List[str]]:
+def _openai_target_candidates_by_change_type(analyzer: BlastRadiusAnalyzer) -> Dict[str, List[str]]:
     return {
         change_type: _intent_target_candidates(analyzer, change_type)
         for change_type in ORDERED_CHANGE_TYPES
     }
 
 
-def _gemini_prompt_target_context(analyzer: BlastRadiusAnalyzer) -> str:
+def _openai_prompt_target_context(analyzer: BlastRadiusAnalyzer) -> str:
     lines = ["Valid target IDs grouped by change_type:"]
-    grouped_targets = _gemini_target_candidates_by_change_type(analyzer)
+    grouped_targets = _openai_target_candidates_by_change_type(analyzer)
     for change_type in ORDERED_CHANGE_TYPES:
         lines.append(f"{change_type}:")
         candidates = grouped_targets.get(change_type, [])
@@ -847,7 +875,7 @@ def _gemini_prompt_target_context(analyzer: BlastRadiusAnalyzer) -> str:
     return "\n".join(lines)
 
 
-def _gemini_prompt(change_payload: str, analyzer: BlastRadiusAnalyzer, strict_mode: bool) -> str:
+def _openai_prompt(change_payload: str, analyzer: BlastRadiusAnalyzer, strict_mode: bool) -> str:
     strict_section = ""
     if strict_mode:
         strict_section = (
@@ -862,51 +890,69 @@ def _gemini_prompt(change_payload: str, analyzer: BlastRadiusAnalyzer, strict_mo
         "Required keys: change_type, target, modification.\n"
         f"Allowed change_type values: {sorted(SUPPORTED_CHANGE_TYPES)}\n\n"
         f"{strict_section}"
-        f"{_gemini_prompt_target_context(analyzer)}\n\n"
+        f"{_openai_prompt_target_context(analyzer)}\n\n"
         "Client change:\n"
         f"{change_payload}"
     )
 
 
-def _infer_intent_with_gemini_attempt(
+def _infer_intent_with_openai_attempt(
     change_text: str,
     analyzer: BlastRadiusAnalyzer,
-    model: str = DEFAULT_GEMINI_MODEL,
+    model: str = DEFAULT_OPENAI_MODEL,
     strict_mode: bool = False,
 ) -> Tuple[Dict[str, Any], str]:
-    _require_gemini_sdk()
-    api_key = _require_gemini_api_key()
+    _require_openai_sdk()
+    api_key = _require_openai_api_key()
 
     change_payload = (change_text or "").strip()
     if not change_payload:
-        raise ValueError("Client change text is empty; cannot infer intent with Gemini.")
+        raise ValueError("Client change text is empty; cannot infer intent with OpenAI.")
 
-    client = gemini_genai.Client(api_key=api_key)
-    response = client.models.generate_content(
+    client = OpenAI(
+        api_key=api_key,
+        organization=_optional_env("OPENAI_ORG_ID"),
+        project=_optional_env("OPENAI_PROJECT_ID"),
+        timeout=_int_env("OPENAI_TIMEOUT_SECONDS", DEFAULT_OPENAI_TIMEOUT_SECONDS, minimum=1),
+        max_retries=_int_env("OPENAI_MAX_RETRIES", DEFAULT_OPENAI_MAX_RETRIES, minimum=0),
+    )
+    response = client.chat.completions.create(
         model=model,
-        contents=_gemini_prompt(change_payload, analyzer, strict_mode=strict_mode),
-        config={
-            "response_mime_type": "application/json",
-            "response_json_schema": _gemini_intent_json_schema(),
+        messages=[
+            {
+                "role": "user",
+                "content": _openai_prompt(change_payload, analyzer, strict_mode=strict_mode),
+            }
+        ],
+        response_format={
+            "type": "json_schema",
+            "json_schema": {
+                "name": "blast_radius_intent",
+                "schema": _openai_intent_json_schema(),
+                "strict": True,
+            },
         },
     )
 
-    response_text = getattr(response, "text", "")
+    choices = getattr(response, "choices", []) or []
+    response_text = ""
+    if choices:
+        response_text = getattr(choices[0].message, "content", "") or ""
     if not response_text or not response_text.strip():
-        raise ValueError("Gemini returned an empty response.")
+        raise ValueError("OpenAI returned an empty response.")
 
     parsed = json.loads(response_text)
     if not isinstance(parsed, dict):
-        raise ValueError("Gemini response must be a JSON object.")
+        raise ValueError("OpenAI response must be a JSON object.")
     return parsed, response_text
 
 
-def infer_intent_with_gemini(
+def infer_intent_with_openai(
     change_text: str,
     analyzer: BlastRadiusAnalyzer,
-    model: str = DEFAULT_GEMINI_MODEL,
+    model: str = DEFAULT_OPENAI_MODEL,
 ) -> Dict[str, Any]:
-    parsed, _ = _infer_intent_with_gemini_attempt(
+    parsed, _ = _infer_intent_with_openai_attempt(
         change_text=change_text,
         analyzer=analyzer,
         model=model,
@@ -991,9 +1037,9 @@ def _load_default_or_interactive_intent(analyzer: BlastRadiusAnalyzer) -> Dict[s
         return _default_intent()
 
 
-def _load_intent_from_gemini(args: argparse.Namespace, analyzer: BlastRadiusAnalyzer) -> Dict[str, Any]:
+def _load_intent_from_openai(args: argparse.Namespace, analyzer: BlastRadiusAnalyzer) -> Dict[str, Any]:
     if not args.client_change_file:
-        raise ValueError("--client-change-file is required when --intent-from-gemini is set.")
+        raise ValueError("--client-change-file is required when --intent-from-openai is set.")
 
     with open(args.client_change_file, "r", encoding="utf-8") as handle:
         change_text = handle.read()
@@ -1003,15 +1049,15 @@ def _load_intent_from_gemini(args: argparse.Namespace, analyzer: BlastRadiusAnal
     errors: List[str] = []
     for strict_mode in (False, True):
         try:
-            parsed, raw_response = _infer_intent_with_gemini_attempt(
+            parsed, raw_response = _infer_intent_with_openai_attempt(
                 change_text=change_text,
                 analyzer=analyzer,
-                model=args.gemini_model,
+                model=args.openai_model,
                 strict_mode=strict_mode,
             )
-            if args.gemini_debug:
+            if args.openai_debug:
                 label = "strict-retry" if strict_mode else "initial"
-                print(f"\n[gemini-debug] raw response ({label}):")
+                print(f"\n[openai-debug] raw response ({label}):")
                 print(raw_response)
             # Validate here so retry/fallback can handle semantic errors early.
             analyzer.validate_and_normalize_intent(parsed)
@@ -1021,7 +1067,7 @@ def _load_intent_from_gemini(args: argparse.Namespace, analyzer: BlastRadiusAnal
             errors.append(f"{label} failed: {exc}")
 
     raise ValueError(
-        "Gemini intent inference failed after 2 attempts. " + " | ".join(errors)
+        "OpenAI intent inference failed after 2 attempts. " + " | ".join(errors)
     )
 
 
@@ -1031,11 +1077,11 @@ def load_intent(args: argparse.Namespace, analyzer: BlastRadiusAnalyzer) -> Dict
     if args.intent_file:
         with open(args.intent_file, "r", encoding="utf-8") as handle:
             return json.load(handle)
-    if args.intent_from_gemini:
+    if args.intent_from_openai:
         try:
-            return _load_intent_from_gemini(args, analyzer)
+            return _load_intent_from_openai(args, analyzer)
         except (ValueError, json.JSONDecodeError) as exc:
-            print(f"Gemini intent inference failed: {exc}")
+            print(f"OpenAI intent inference failed: {exc}")
             print("Falling back to interactive/default intent input.")
             return _load_default_or_interactive_intent(analyzer)
 
@@ -1079,7 +1125,7 @@ def report_to_markdown(report: Dict[str, Any]) -> str:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Blast radius analyzer")
-    default_gemini_model = os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
+    default_openai_model = os.getenv("OPENAI_MODEL", DEFAULT_OPENAI_MODEL)
     parser.add_argument("--project-path", default="project", help="Path to Python project")
     parser.add_argument(
         "--allow-symbol-target",
@@ -1089,26 +1135,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--intent-file", help="Path to JSON file containing change intent")
     parser.add_argument("--intent-json", help="Inline JSON string containing change intent")
     parser.add_argument(
-        "--intent-from-gemini",
+        "--intent-from-openai",
         action="store_true",
-        help="Infer change intent from client change text using Gemini",
+        help="Infer change intent from client change text using OpenAI",
     )
     parser.add_argument(
         "--client-change-file",
-        help="Path to file containing client-side code changes/diff for Gemini intent inference",
+        help="Path to file containing client-side code changes/diff for OpenAI intent inference",
     )
     parser.add_argument(
-        "--gemini-model",
-        default=default_gemini_model,
+        "--openai-model",
+        default=default_openai_model,
         help=(
-            "Gemini model for intent inference "
-            f"(default: {default_gemini_model}; env: GEMINI_MODEL)"
+            "OpenAI model for intent inference "
+            f"(default: {default_openai_model}; env: OPENAI_MODEL)"
         ),
     )
     parser.add_argument(
-        "--gemini-debug",
+        "--openai-debug",
         action="store_true",
-        help="Print raw Gemini response before parsing/validation",
+        help="Print raw OpenAI response before parsing/validation",
     )
     parser.add_argument(
         "--list-targets",

@@ -1,158 +1,38 @@
 {
   "change": {
-    "change_type": "function_logic_change",
-    "target": "function:services.user_service.create_user",
-    "target_display": "create_user",
-    "modification": "adjust validation flow"
+    "change_type": "data_model_change",
+    "target": "data:request.get",
+    "target_display": "request.get",
+    "modification": "add optional nickname field to user create endpoint request payload"
   },
   "direct_impacts": [
-    {
-      "component": "class:models.user_model.User",
-      "name": "User",
-      "component_type": "class",
-      "module": "models.user_model",
-      "impact_type": "Direct",
-      "category": "Data Handling",
-      "dependency_types": [
-        "DEPENDS_ON"
-      ],
-      "path": [
-        "function:services.user_service.create_user",
-        "class:models.user_model.User"
-      ],
-      "reason": "Impact propagates via relations [DEPENDS_ON] along path: create_user -> User"
-    },
     {
       "component": "function:api.user_api.post_user",
       "name": "post_user",
       "component_type": "function",
       "module": "api.user_api",
       "impact_type": "Direct",
-      "category": "API-Level",
-      "dependency_types": [
-        "CALLS"
-      ],
-      "path": [
-        "function:services.user_service.create_user",
-        "function:api.user_api.post_user"
-      ],
-      "reason": "Impact propagates via relations [CALLS] along path: create_user -> post_user"
-    },
-    {
-      "component": "function:database.db.save_user",
-      "name": "save_user",
-      "component_type": "function",
-      "module": "database.db",
-      "impact_type": "Direct",
-      "category": "Business Logic",
-      "dependency_types": [
-        "CALLS"
-      ],
-      "path": [
-        "function:services.user_service.create_user",
-        "function:database.db.save_user"
-      ],
-      "reason": "Impact propagates via relations [CALLS] along path: create_user -> save_user"
-    },
-    {
-      "component": "function:utils.validation.validate_user",
-      "name": "validate_user",
-      "component_type": "function",
-      "module": "utils.validation",
-      "impact_type": "Direct",
-      "category": "Business Logic",
-      "dependency_types": [
-        "CALLS"
-      ],
-      "path": [
-        "function:services.user_service.create_user",
-        "function:utils.validation.validate_user"
-      ],
-      "reason": "Impact propagates via relations [CALLS] along path: create_user -> validate_user"
-    }
-  ],
-  "indirect_impacts": [
-    {
-      "component": "data:self.age",
-      "name": "self.age",
-      "component_type": "data_entity",
-      "module": "models.user_model",
-      "impact_type": "Indirect",
       "category": "Data Handling",
       "dependency_types": [
-        "DEPENDS_ON",
-        "WRITES"
-      ],
-      "path": [
-        "function:services.user_service.create_user",
-        "class:models.user_model.User",
-        "data:self.age"
-      ],
-      "reason": "Impact propagates via relations [DEPENDS_ON -> WRITES] along path: create_user -> User -> self.age"
-    },
-    {
-      "component": "data:self.username",
-      "name": "self.username",
-      "component_type": "data_entity",
-      "module": "models.user_model",
-      "impact_type": "Indirect",
-      "category": "Data Handling",
-      "dependency_types": [
-        "DEPENDS_ON",
-        "WRITES"
-      ],
-      "path": [
-        "function:services.user_service.create_user",
-        "class:models.user_model.User",
-        "data:self.username"
-      ],
-      "reason": "Impact propagates via relations [DEPENDS_ON -> WRITES] along path: create_user -> User -> self.username"
-    },
-    {
-      "component": "data:user.username",
-      "name": "user.username",
-      "component_type": "data_entity",
-      "module": "database.db",
-      "impact_type": "Indirect",
-      "category": "Data Handling",
-      "dependency_types": [
-        "CALLS",
         "READS"
       ],
       "path": [
-        "function:services.user_service.create_user",
-        "function:database.db.save_user",
-        "data:user.username"
+        "data:request.get",
+        "function:api.user_api.post_user"
       ],
-      "reason": "Impact propagates via relations [CALLS -> READS] along path: create_user -> save_user -> user.username"
-    },
-    {
-      "component": "function:models.user_model.User.__init__",
-      "name": "__init__",
-      "component_type": "function",
-      "module": "models.user_model",
-      "impact_type": "Indirect",
-      "category": "Business Logic",
-      "dependency_types": [
-        "DEPENDS_ON",
-        "DEPENDS_ON"
-      ],
-      "path": [
-        "function:services.user_service.create_user",
-        "class:models.user_model.User",
-        "function:models.user_model.User.__init__"
-      ],
-      "reason": "Impact propagates via relations [DEPENDS_ON -> DEPENDS_ON] along path: create_user -> User -> __init__"
+      "reason": "Impact propagates via relations [READS] along path: request.get -> post_user"
     }
   ],
+  "indirect_impacts": [],
   "risk_areas": [
     "Unknown Impact Zone: unresolved symbols or dynamic behavior detected.",
-    "Unknown test coverage for impacted components."
+    "Unknown test coverage for impacted components.",
+    "Data model change can propagate through mappings and persistence boundaries."
   ],
   "unknown_impact_zones": [
     "Unresolved symbol: app.route",
     "Unresolved symbol: print",
     "Unresolved symbol: request.get"
   ],
-  "severity": "high"
+  "severity": "medium"
 }

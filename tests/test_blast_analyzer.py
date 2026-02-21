@@ -90,26 +90,26 @@ class BlastAnalyzerTests(unittest.TestCase):
         _, target = relaxed.validate_and_normalize_intent(raw)
         self.assertEqual(target, "function:services.user_service.create_user")
 
-    def _gemini_args(self, client_change_file: str) -> argparse.Namespace:
+    def _openai_args(self, client_change_file: str) -> argparse.Namespace:
         return argparse.Namespace(
             project_path="project",
             allow_symbol_target=False,
             intent_file=None,
             intent_json=None,
-            intent_from_gemini=True,
+            intent_from_openai=True,
             client_change_file=client_change_file,
-            gemini_model="gemini-test-model",
-            gemini_debug=False,
+            openai_model="gpt-4o-mini-test",
+            openai_debug=False,
             list_targets=False,
             output_json="blast_report.json",
             output_md="blast_report.md",
         )
 
-    def test_load_intent_from_gemini_success_path(self) -> None:
+    def test_load_intent_from_openai_success_path(self) -> None:
         with TemporaryDirectory() as tmpdir:
             change_file = Path(tmpdir) / "client.diff"
             change_file.write_text("rename age -> user_age in request payload", encoding="utf-8")
-            args = self._gemini_args(str(change_file))
+            args = self._openai_args(str(change_file))
             inferred = {
                 "change_type": "function_logic_change",
                 "target": "function:services.user_service.create_user",
@@ -117,7 +117,7 @@ class BlastAnalyzerTests(unittest.TestCase):
             }
 
             with patch(
-                "blast_analyzer._infer_intent_with_gemini_attempt",
+                "blast_analyzer._infer_intent_with_openai_attempt",
                 return_value=(inferred, json.dumps(inferred)),
             ) as mocked:
                 raw = blast_analyzer.load_intent(args, self.analyzer)
@@ -125,11 +125,11 @@ class BlastAnalyzerTests(unittest.TestCase):
             self.assertEqual(raw, inferred)
             self.assertEqual(mocked.call_count, 1)
 
-    def test_load_intent_from_gemini_retries_after_validation_error(self) -> None:
+    def test_load_intent_from_openai_retries_after_validation_error(self) -> None:
         with TemporaryDirectory() as tmpdir:
             change_file = Path(tmpdir) / "client.diff"
             change_file.write_text("client contract update", encoding="utf-8")
-            args = self._gemini_args(str(change_file))
+            args = self._openai_args(str(change_file))
 
             invalid = {
                 "change_type": "function_logic_change",
@@ -143,7 +143,7 @@ class BlastAnalyzerTests(unittest.TestCase):
             }
 
             with patch(
-                "blast_analyzer._infer_intent_with_gemini_attempt",
+                "blast_analyzer._infer_intent_with_openai_attempt",
                 side_effect=[(invalid, json.dumps(invalid)), (valid, json.dumps(valid))],
             ) as mocked:
                 raw = blast_analyzer.load_intent(args, self.analyzer)
@@ -151,14 +151,14 @@ class BlastAnalyzerTests(unittest.TestCase):
             self.assertEqual(raw, valid)
             self.assertEqual(mocked.call_count, 2)
 
-    def test_load_intent_from_gemini_falls_back_to_default_in_non_interactive_mode(self) -> None:
+    def test_load_intent_from_openai_falls_back_to_default_in_non_interactive_mode(self) -> None:
         with TemporaryDirectory() as tmpdir:
             change_file = Path(tmpdir) / "client.diff"
             change_file.write_text("client contract update", encoding="utf-8")
-            args = self._gemini_args(str(change_file))
+            args = self._openai_args(str(change_file))
 
             with patch(
-                "blast_analyzer._infer_intent_with_gemini_attempt",
+                "blast_analyzer._infer_intent_with_openai_attempt",
                 side_effect=[ValueError("bad response"), ValueError("still bad")],
             ):
                 with patch("sys.stdin.isatty", return_value=False):
@@ -166,11 +166,11 @@ class BlastAnalyzerTests(unittest.TestCase):
 
             self.assertEqual(raw, blast_analyzer._default_intent())
 
-    def test_load_intent_from_gemini_invalid_target_reports_clear_error(self) -> None:
+    def test_load_intent_from_openai_invalid_target_reports_clear_error(self) -> None:
         with TemporaryDirectory() as tmpdir:
             change_file = Path(tmpdir) / "client.diff"
             change_file.write_text("client contract update", encoding="utf-8")
-            args = self._gemini_args(str(change_file))
+            args = self._openai_args(str(change_file))
 
             invalid = {
                 "change_type": "function_logic_change",
@@ -179,14 +179,14 @@ class BlastAnalyzerTests(unittest.TestCase):
             }
 
             with patch(
-                "blast_analyzer._infer_intent_with_gemini_attempt",
+                "blast_analyzer._infer_intent_with_openai_attempt",
                 side_effect=[(invalid, json.dumps(invalid)), (invalid, json.dumps(invalid))],
             ):
                 with self.assertRaises(ValueError) as ctx:
-                    blast_analyzer._load_intent_from_gemini(args, self.analyzer)
+                    blast_analyzer._load_intent_from_openai(args, self.analyzer)
 
             message = str(ctx.exception)
-            self.assertIn("Gemini intent inference failed after 2 attempts", message)
+            self.assertIn("OpenAI intent inference failed after 2 attempts", message)
             self.assertIn("Target 'function:does.not.exist' not found in graph.", message)
 
 

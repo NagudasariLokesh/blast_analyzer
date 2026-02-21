@@ -1,0 +1,35 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Test / type-check / lint caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Coverage outputs
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Local virtual environments
+.venv/
+venv/
+env/
+buildenv/
+
+# Environment/secrets
+.env
+.env.*
+
+# Generated analyzer outputs
+blast_report.json
+blast_report.md
+
+# Editor and OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
